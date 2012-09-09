@@ -1,0 +1,359 @@
+			===================================================
+			System/T - Implementation of a Transactional Store.
+			===================================================
+
+
+Satya Popuri,
+spopur2 [at] uic [dot] edu
+
+
+CONTENTS
+========
+
+1. Introduction
+2. Features
+3. Design of the system
+   3a. The datastore and its index
+   3b. Internal data structures
+   3c. Communication protocols
+   3d. Transactional operations
+   3e. Logging and Recovery
+4 .Concurrency 
+5. Deadlocks and starvation
+6. Conclusion
+7. References
+
+
+
+1. Introduction
+================
+
+System/T is a transactional storage system developed for the Networked Operating Systems (CS485) class at UIC during spring 2007. This system provides read/write and other operations on a persistent store wrapped inside transactions that provide ACID properties to such operations. Application developers write 
+	 
+	 BEGIN (T)
+	       < operation 1 > 
+	       < operation 2 >
+	       ...
+	       ...
+	       < operation n >
+	 END (T)
+
+in their programs to wrap operation 1 through n inside a transaction. The program can then be linked to a library (libtransaction) that provides implementations of macros BEGIN and END and operations on T. The system also consists of a `` Transaction Monitor'' that arbitrates between different processes accessing the store using the library. Transactions operate on blocks of 4KB in a data store. 
+
+This document describes my design and implementation of such a storage system. The name System/T is reminiscent of the naming conventions IBM used for their older transaction processing system IMS/DC.
+
+
+2. Features
+============
+
+What works:
+     * Wrap operations inside transactions providing ACID properties
+     * Any number of operations on the store in any order (yes, write after read is possible)
+     * Full write-ahead logging and online rollback provided to achieve durability
+     * Read following a write of a block returns the value just written, thus preserving semantics within the
+       same transaction
+     * Multiple reads and writes on the same block are allowed in any order.
+     * Transaction Monitor detects transactions that fail at any point and rolls back any committed changes
+     * If the Transaction Monitor dies, no transactions can happen until it is brought up
+     * A recovery program is provided, that can read the write-ahead log and undo any half-committed transactions
+     * Maximum concurrency is allowed by not restricting an reads (to the same block) or writes to different blocks
+     * Deadlocks and starvation are avoided by using my algorithm (described below) to timeout and preempt older
+       transactions.
+     * Transactions can be restarted. A transaction sleeps a certain amount of time determined by the binary exponential
+       back off algorithm 
+
+What does not work:
+     * I have not implemented Log trimming, as this could add further complexity to the solution.
+
+
+3. Design of System/T
+=====================
+
+The system is designed in two parts: 
+    
+    (i)  A transaction library that links with application programs
+    (ii) A Transaction Monitor that arbitrates between different processes.
+
+The transaction library (called libtransaction.a) provides all data structures needed to begin a transaction, perform operations on the store and commit the transaction. Each process using the library contacts the monitor (or server) before performing any operations. Thus, all operations on the store are in general guarded by this central server so that the processes do not step on each others feet.
+
+
+3a. The data store and index
+----------------------------
+
+The data store is just a flat file without any specific formatting restrictions. It is treated as a series of bytes just like a UNIX file. It is written in binary mode in blocks of 4KB. In my system, this file is called 'datastore.db'. Another file called 'dataindex.ix' maintains a primitive index to the blocks in the store. Byte N of the index file contains the ASCII character 'U' if block N of the data store is 'Unallocated' (or not allocated at all), and an 'A' if some process has allocated the block. The constant NBLOCKS in file config.h will determine how many blocks the transactional store contains. The default is 15, but it can always be changed before compilation.
+
+The program initstore initializes the data store and index files. This program is built and run on each invocation of `make' command.
+
+
+3b. Internal data structures
+-----------------------------
+
+The main data structure in libtransaction.a is the Transaction class. This class implements read(), write(), allocate(), release() and abort methods for the application programs. Thus a sample program might look like this:
+
+	 BEGIN(T)
+		T.read(5);
+		T.write(6,oldval,newval);
+		T.release(7);
+	END(T)
+
+The BEGIN and END macros are implemented with try and catch constructs as follows:
+
+# define Begin(T) begin_transaction: 
+                   try{ 
+                   Transaction T; 
+
+# define End(T) } 
+                catch (TransactionException tex) 
+                { 
+                  switch (tex) 
+                    { 
+                    case TE_ABORT: 
+                      cerr<<"Transaction failed. Now aborting!"<<endl; \
+                      exit(1); 
+                      break; 
+                    case TE_RESTART: 
+                      goto begin_transaction; 
+                      break; 
+                    } 
+                } 
+
+When a Transaction object is constructed, it first contacts the Transaction Monitor (called TM hereafter) to announce the beginning of a new transaction. The TM then records the event and assigns a new TRID (Transaction ID) to this transaction. This TRID is used by the process in all further communication with the TM.
+
+Each Transaction object has a 'blockmap' data structure. This is an STL map used for buffer management. Whenever a block is read into memory from the data store, it is cached in the blockmap with its block number as the key. Further writes and read to the same block in the transaction are performed on this cached copy instead of directly writing to the store. This has two consequences on the overall design - the number of file reads and writes are decreased, and aborting the transaction becomes easier (consists of just throwing away the cached blocks). A block in the block map carries additional information such as lock type and the old value of the block (before the transaction began). 
+
+Each transaction object also contains a LogManager object that can deal with the log file (more on logging later). TCP/IP stream sockets are used for communication with the TM, so that the TM can reliably detect a process failure (as the TCP stack send a FIN to the monitor when a client process dies).
+
+The Transaction Monitor maintains a bunch of useful data structures to track transaction states and who is doing what on the system. Here is a brief summary:
+
+1. transactions - is an STL map that maps network socket descriptors to transaction IDs.
+2. status       - another STL map maps transaction IDs to their 'tstat' structures. Each tstat structure contains further information about a transaction.
+3. blockmap     - The blockmap on the server side records who are/is the current readers/writer for a given data block.
+
+These 3 maps along with a LogManager to deal with rollback of clients that died in the process of committing a transaction, form powerful instruments for the TM to arbitrate between concurrent process.
+
+
+3c. Communication protocols
+----------------------------
+
+All transactions have to approach the TM for permission on whatever they do with the data store. For example, if a transaction wants to write a block of data, it has to ask the TM for permission. The TM will then look at its blockmap, and decide to grant permission if there are no readers or writers to that block. Otherwise the transaction may have to restart and try again later (see section on deadlocks and starvation for more info). 
+
+The structure used for communication between TM and processes called a ``transaction request'' is defined in the file trq.hh
+
+struct trq
+{
+  enum request_t { BEGIN, COMMIT, END, READ, WRITE, ABORT, ALLOCATE, RELEASE, RESTART };
+  enum reply_t { OK, NOT_OK };
+
+  trid_t    tid;                // Transaction ID                                                                          
+  pid_t     pid;                // process ID that sent this request                                           
+  request_t request;            // begin/read/write/abort/allocate/release/rollback                      
+  reply_t   reply;              // reply from server                                             
+  int       block_no;           // Block number affected in this transaction.
+};
+
+Basically, the server is contacted for each request, and it replies with an OK or NOT_OK. The server multiplexes clients roughly in a FIFO order using the select() system call. More info on each operation is given in the next section.
+
+
+3d. Transactional operations
+-----------------------------
+
+This section describes in detail how each operation on the store is handled by the TM and libtransaction duo.
+
+
+BEGIN(T) (Transaction constructor) 
+
+The transaction sends a BEGIN request to the TM. If TM is down, the transaction cannot proceed and is aborted. Otherwise, it gets back a TRID (transaction ID) from the server. On the server side, the new transaction is added to the ``transaction'' and ``status'' maps. The TRID is formed by adding a random number to the unique PID of the process.
+
+T.allocate()
+
+The Allocate method must first find a free block in the database. The function find_free_block does a linear search through the index file and finds the first block that is marked by a 'U' and returns the block number. A request is then sent to the TM asking for a WRITE lock on this block. If the TM had already gotten a similar request on the same block from another transaction and had granted permission, it will say NOT_OK, and this transaction has to find another free block. This can repeat until the transaction tried all NBLOCKS available (in the worst case) and then the transaction restarts if no free blocks are available. 
+
+If the TM finds that there were no prior requests to WRITE LOCK the same block, it grants permission and adds the process as a WRITER to the block in its blockmap.
+
+If the TM replies OK to an allocate request, the transaction now has a write lock on the block. It creates an in-memory block of size BLOCKSIZE and adds it to the blockmap. All further reads/writes happen to this copy and not to the store. Newly allocated blocks in the blockmap have a lock type A_LOCK.
+
+
+T.read()
+
+This method has to read a block from the store. It first checks for the same block in the blockmap. If present, it means either we read it previously or it is a newly allocated block. In either case, it returns the contents of the block without further ado. There is one exception to this process. If the block was previously released by the same transaction, we cannot allow a read, and so the transaction aborts.
+
+In case, we do not have the requested block in the blockmap, it has to be obtained from the store. For this, we need a READ LOCK on the block. The transaction asks the TM for permission. The TM checks it's blockmap if there is any WRITER for the block. If so, the permission cannot be granted (There is more logic involved here. See section on deadlocks) and the transaction has to be restarted.
+
+Upon receiving an OK from the TM, the transaction reads the block into an in-memory block and returns it to the user. The block is added to the blockmap with a lock type of R_LOCK.
+
+
+T.write()
+
+Again, we check the blockmap to see if we already have the requested block. The lock type becomes more important here.
+
+(i)   If we had an A_LOCK, it is equivalent to a write lock, so we can go ahead and write to the block in memory.
+(ii)  If we had a W_LOCK, it is OK to write to the block.
+(iii) If we had an S_LOCK (a release lock), the transaction tired to write a released block, so we abort it.
+(iv)  If we had an R_LOCK, we have insufficient privileges to write to the block, and hence have to ask the TM for a possible upgrade.
+(v)   If we did not have this block in memory, it has to be read from the store and a new value has to written.
+
+In case (iv) and (v), we proceed to ask the TM for a WRITE LOCK on the block. The TM checks its blockmap - if the block is in the blockmap, and the requesting process is the SOLE READER of the block, it adds the process as a WRITER for the block (hence upgrading the lock) and grants permission. If the block is not in the blockmap or there are no readers or writers to the block, permission is immediately granted. 
+
+But if the block had any readers or writer, then further decisions are taken according to algorithms described in the section on deadlocks and starvation.
+
+Finally, let us say the transaction was granted permission to write to block X. At this point, in case (iv), the lock type of the in-memory block is changed to W_LOCK and the block is written to. In case (v), a new block is created in the memory, the old data from the store is read into it, and preserved for logging. The new value supplied by the user is stored in the ``data'' variable of the block.
+
+
+T.release()
+
+If we want to release a block, we need a WRITE LOCK on it. Hence, the procedure is very similar to write locking both on the client and server side. The lock type is set to S_LOCK to indicate a release.
+
+
+T.abort()
+
+This function immediately aborts the transaction. It is a very minimal function that just throws a TE_ABORT exception, which will result in the transaction object's destructor being called. The destructor frees all allocated memory. The process then exits as defined in the END macro. This event will be detected by the TM and it flushes all its records of the transaction initiated by this process.
+
+
+END(T)
+
+This macro implements a catch statement for exceptions thrown by a Transaction object. The destructor of the Transaction object is called before entering any exception processing code. It examines if there had been any error and if there was no error, calls the commit() method to start committing everything to disk.
+
+The commit() method
+
+This method first informs the TM that it has begun committing. The TM marks the state of the transaction to be COMMITTING. Then the process writes BEGIN to the log. The blockmap is examined and for each block in the map, if the lock on the block is :
+
+ - an A_LOCK : write ALLOCATE to the log, seek to appropriate byte in the index file and write an 'A'
+ - a  W_LOCK : write WRITE to the log, seek to the appropriate block and write out the modified data.
+ - an S_LOCK : write RELEASE to the log, seek to appropriate byte in the index file, write a 'U'
+ - a  R_LOCK : reads need not be logged as they do not affect the rollback process.
+
+For A_LOCK'ed blocks, I do not change the lock type when they are read/written to. As a result, it is important to proceed with the actions of a W_LOCK'ed block after writing the index file.
+
+Finally, the commit() function writes and END to the log and informs the TM that it has committed successfully.
+
+If the process fails in the middle of a commit(), the TM detects this event, and sees that the transaction was in COMMITTING state. So it will command the LogManager to rollback the actions taken by the process during the commit().
+
+
+Restarting a transaction
+------------------------
+
+When a transaction fails to get a lock on a block, it might have to restart. The restart() method of Transaction class is called whenever such a situation arises. This method calls backoff_sleep() which implements a binary exponential backoff algorithm to determine sleep time. The sleep() system call is called to rest the process for a while before restarting. Then a TE_RESTART exception is thrown which will result in the destructor being called. The destructor skips the commit() process because an error has occurred, and frees all blocks in the blockmap. The END() macro then has a ``goto'' statement to loop back to ``begin_transaction'' where a new transaction object is created.
+
+
+
+3e. Logging and recovery
+========================
+
+The two operations logging and recovery are implemented by the LogManager class. The log file is chosen to be a binary file for fast recovery operations. However, an ascii log is also written by the LogManager to help visualize what is happening. The logfile is defined by LOGFILE macro and the ascii logfile is ALOGFILE in the config.h include file. 
+
+The structure of a log record is very simple:
+
+enum logAction { LWRITE, LALLOCATE, LABORT, LRELEASE, LBEGIN, LEND };  
+struct logrecord
+{
+  trid_t tid;			// Transaction ID
+  logAction action;		// What action has been performed
+  int block;			// Block affected in this transaction
+  byte oldval[BLOCKSIZE];       // old value in case of write and release
+};
+
+
+The log() method of the LogManager class takes these members as arguments and writes one log record to the log file. 
+
+
+Recovery
+--------
+
+The log is always an UNDO log. No REDO operations will happen with this kind of setup. If a transaction fails after it had written BEGIN to the log but before it wrote END, the TM will notice this and ask the log manager to rollback the current transaction the process was executing. The rollback() method of LogManager takes transaction ID as an argument. It reads the log file backwards (for efficiency) and collects all the records belonging to the given transaction. The method undo_rec takes care of undoing each operation in this list. After this, and ABORT is written to the log with the same transaction ID to mean that this transaction was successfully aborted (rolled back)
+
+
+If the Transaction Monitor fails, a recovery program (called recover) is provided to scan the log and undo any unfinished transactions. For each transaction in the log, if we find an END record or an ABORT record, we need not do anything for it. Otherwise, we need to undo the actions of the transaction if we do not find either.
+
+
+
+4. Dealing with Concurrency
+===========================
+
+System/T deals very well with concurrent processes. Each process can get write locks unless another process already got a lock on a given block. As long as the blocks are independent, all transactions can operate on the data store in parallel. This condition relaxes even further for READs. Any number of transactions can obtain READ locks on a given block without being obstructed. 
+
+There is no limit on the number of transactions committing at the same time on the system. Transactions use rigorous two phase locking - none of the locks (including shared locks) are released until all actions are committed. Of course like any system that allows concurrency, System/T needs to deal with deadlocks and possible starvation of transactions. The binary back off sleep implemented in each transaction avoids starvation to some extent by waiting longer each time before trying again. The other algorithms implemented for management of deadlock and starvation issues are described below.
+
+
+5. Deadlocks and Starvation
+===========================
+
+A deadlock forms in the system when there is a cycle in requests for blocks. For example,
+
+		 T1 write locks block 1
+		 T2 write locks block 2
+		 
+		 T1 requests a read lock on block 2
+		 T2 requests a read lock on block 5
+
+
+In the absence of any deadlock and starvation prevention mechanisms, each transaction will restart and deadlock again (even if we use a random sleep time before restart, we cannot guarantee that they will not deadlock again nor can we guarantee that a third transaction will not get into the fray).
+
+In order to guarantee no deadlock / starvation on the system, I have designed the following scheme: 
+
+ * When a transaction (say T1) issues a BEGIN request, it is time stamped. 
+ * Each transaction is allowed a certain ``time slice'' before which it must complete.
+ * The above condition holds only in the face of competition. As long as there are no transactions requesting for the same locks as T1, it can run happily as long as it wants (even with an expired time slice).
+ * Also the condition does not hold if time slice expires after the transaction has started committing.
+ * If there is a transaction T2 asking for conflicting locks with T1, the conflict is resolved as follows:
+
+
+Case 1: T2 is asking for a write lock on a block that has another writer T1 currently holding the lock:
+     
+      - If T2 had started earlier than T1, preempt T1 and grant access to T2. (preference goes to older transactions) 
+Otherwise, 
+      - If T1 has run out of its time slice, preempt T1 and allow T2 to get the write lock. 
+      - otherwise, T2 will have to restart using its binary back off sleep timer.
+
+
+Case 2: T2 is asking for a write lock on a block that has a bunch of readers (T1, T3, ... Tn) holding read locks:
+
+     - If at least one of (T1...Tn) OLDER than T2, has NOT out run its time slice then
+       preempt T2 and ask it to restart afresh.
+
+     - Otherwise, we can easily see that there are either older transactions with expired time slices or transactions
+       that are newer than T2 in the readers list. Preempt ALL of them and grant write lock to T2.
+
+
+Case 3: T2 is asking for a READ lock on a block that has a writer T1 currently holding for a lock.
+
+     - Here the exact same logic as Case 1 applies. 
+
+
+There is no Case 4 (T2 asking for a READ lock on a block that has a bunch of readers) conflict. 
+
+
+To see how this scheme works, let us consider Coffman's conditions for deadlock:
+
+   1. Mutual exclusion condition: a resource is either assigned to one process or it is available
+   2. Hold and wait condition: processes already holding resources may request new resources
+   3. No preemption condition: only a process holding a resource may release it
+   4. Circular wait condition: two or more processes form a circular chain where each process waits for a resource that the next process in the chain holds
+
+Deadlock only occurs in systems where all 4 conditions happen.
+
+(Source: http://en.wikipedia.org/wiki/Deadlock)
+
+In our case, the mutual exclusion condition will hold in case of write locks. Hold and wait cannot occur: In case of older transactions asking for more locks, they will be granted (at the cost of younger transactions) if they haven't run out of their time slices. Thus, we do not keep them waiting for resources. 
+
+However, rouge transactions can hold resources and go into infinite loops are long processing loops without releasing them. This is where the No preemption condition is broken. The TM can release resources held by a transaction if it runs out of it's time slice in the face of conflicts. 
+
+Finally circular wait cannot happen because in case of conflicts, one of the transactions is always preempted based on age.
+
+Note that transactions that have started committing will never be preempted even though they have exceeded their time slice. This is because, once the transaction sent a 'committing' message to the server, all the code that executes until the 'END' message is sent is within libtransaction.a. This code is trustworthy and can be allowed to run to completion without the problem of inifinite loops.
+
+The scheme will also protect against starvation since each transaction runs only for a limited time in the face of conflicts, and the re-trying transactions will ultimately get a lock. Another protection that can be used as a last resort is to abort a transaction after a maximum number of retries. 
+
+
+6. Conclusion
+==============
+
+System/T took a significant amount of thinking and coding. This is a fairly complex problem that has a non trivial implementation. I would like to attribute my success to Jim Gray and Andreas Reuter who have written a wonderful book on the concepts of transaction processing.
+
+
+7. References
+=============
+
+[1] Jim Gray and Andreas Reuter - Transaction Processing: Concepts and Techniques
+[2] Wikipedia : http://en.wikipedia.org
+[3] W. Richard Stevens - Advanced Programming in the UNIX Environment
+[4] Gary Nutt - Operating Systems (Third edition, Addison Wesley)

@@ -1,0 +1,371 @@
+				============================================
+				System/T testing procedures and test results
+				============================================
+
+Satya Popuri
+spopur2 [at] uic [dot] edu
+
+
+Introduction
+============
+
+This document describes the test scripts provided with System/T and how to run them. It also goes into some detail about how the test transactions were written and what results are expected when they are run.
+
+
+NOTE: All testing described in this document was done with 4 byte blocks for better clarity. However, the BLOCKSIZE macro in config.h remains to be 4096 as per the specification. You can always change it before compilation if you want to.
+
+How to run the tests
+====================
+
+Run the following commands:
+
+$ make 
+$ ./tpmd
+
+[start a new screen session or terminal emulator window]
+
+$ ./serial_tests
+
+[runs the serials tests]
+
+
+$ ./concurrent_tests
+
+[runs the concurrent tests]
+
+
+More information on how to observe rollback and recovery services provided by the Transaction Monitor are provided in the Logging section below.
+
+
+Serial Tests
+============
+
+These tests programs run one after the other, so there will be no concurrency at all. These transactions are designed to test out the basic store oprations. The specification requires that store operations can be done in any order as long as they are encapsulated inside transactions. Also, for extra credit, System/T permits a lock upgrade within a transaction. All these features are tested by carefully crafting transactions in the following serial tests:
+
+
+Serial test st1.cc
+------------------
+
+This is a small transaction that allocated 5 blocks inside a loop. This sets the stage for the rest of the test to play around with the allocated blocks (Read, write etc.)
+
+expected output: (after initializing the store)
+
+[client side output]
+
+Allocated block #1
+Allocated block #2
+Allocated block #3
+Allocated block #4
+Allocated block #5
+
+[server side output]
+
+Transaction Processing monitor running on port 2983...
+Assigned new TID : 1 to process 14429
+Transaction #1 is a writer for block # 1
+Transaction #1 is a writer for block # 2
+Transaction #1 is a writer for block # 3
+Transaction #1 is a writer for block # 4
+Transaction #1 is a writer for block # 5
+Process 14429 transaction 1 committed successfully
+Transaction 1 has disconnected.
+Flushing transaction..1
+
+
+Serial test st2.cc
+------------------
+
+This program has Begin(T) and End(T) macros inside a loop. This will demonstrate that any number of transactions can be initiated from the same program. This is also the general character of many real world transaction processing programs. 
+
+The transaction encapsulated in the loop allocates a block, then writes to the same block and reads it back to check that "read after write" semantics are preserved within the same transaction.
+
+[client side output]
+
+Reading block #1
+0000
+writing a string to newly allocated block 6
+Now reading the newly allocate block back
+BBBB
+Reading block #1
+0000
+writing a string to newly allocated block 7
+Now reading the newly allocate block back
+BBBB
+
+[server side output]
+
+Assigned new TID : 2 to process 14430
+Transaction #2 is a writer for block # 6
+Transaction #2 is a reader for block # 1
+Process 14430 transaction 2 committed successfully
+Transaction 2 has disconnected.
+Flushing transaction..2
+Assigned new TID : 3 to process 14430
+Transaction #3 is a writer for block # 7
+Transaction #3 is a reader for block # 1
+Process 14430 transaction 3 committed successfully
+Transaction 3 has disconnected.
+Flushing transaction..3
+
+
+Serial test st3.cc
+------------------
+
+This is a more rigorous test in terms of number of operations done on the store. This program also tests the Release operation on newly allocated blocks as well as existing blocks in the store.
+
+writing block #1 as CCC..
+Block 1 previously was: 
+0000
+Allocated block # 8
+Allocated block # 9
+Writing 8 as DDD.. 
+Writing 9 as EEE.. 
+Releasing block 5
+(Release after allocate) Releasing block 9
+(Read after write) Reading block 8
+DDDD
+Writing block #2
+
+[server side output]
+
+Assigned new TID : 4 to process 14431
+Transaction #4 is a writer for block # 1
+Transaction #4 is a writer for block # 8
+Transaction #4 is a writer for block # 9
+Transaction #4 is a writer for block # 5
+Transaction #4 is a writer for block # 2
+Process 14431 transaction 4 committed successfully
+Transaction 4 has disconnected.
+Flushing transaction..4
+
+
+Serial test st4.cc
+------------------
+
+This test is dedicated to demonstrating a lock upgrade (from a Read lock to a write lock) in the same transaction. 
+
+[client side output]
+
+Reading block 2
+block info:
+KKKK
+Reading block 3
+block info:
+0000
+writing FFF.. to block 2
+Block 2 previously was: 
+block info:
+KKKK
+
+
+[server side output]
+
+Assigned new TID : 5 to process 14432
+Transaction #5 is a reader for block # 2
+Transaction #5 is a reader for block # 3
+Transaction #5 is a writer for block # 2
+Process 14432 transaction 5 committed successfully
+Transaction 5 has disconnected.
+Flushing transaction..5
+
+
+Concurrent tests
+================
+
+These tests are designed to deliberately step on each other's feet. (Of course, the serial tests can also be run concurrently as System/T has full concurrency support). The output from the test script explains how the tests are arranged. 
+
+
+
+$ ./concurrent_tests
+
+****** Current tests setup ****
+===============================
+
+Transaction #1 read locks blocks #2 and #3 and write locks block #1
+Transaction #2 read locks blocks #2 and #3 concurrently and sleeps for a long time
+Transaction #3 asks for a write lock on #1 and #2
+
+The affect is that trn #3 restarts a few times until trn #1 releases its locks
+trn #2 will be preempted by the monitor since it was taking too long to complete
+trn #3 will be granted locks after #1 completes
+
+Hit <Enter> to start concurrent tests
+
+ct1.cc: Reading block 2
+FFFF
+ct1.cc: Reading block 3
+0000
+ct1.cc: Now writing GGG.. to block 1
+ct1.cc: Block 1 previously was:
+CCCC
+ct2.cc: Now reading block 2
+FFFF
+ct2.cc: Now reading block 3
+0000
+
+ct3.cc: Asking to write block #1
+ct3.cc: Block 1 written
+ct3.cc: Asking to write 2
+libtransaction[tid #8]: transaction monitor denied write access to block # 2 at this time.
+libtransaction: sleeping 1 seconds before restarting.
+Restarting transaction...
+libtransaction: starting transaction # 9
+ct3.cc: Asking to write block #1
+ct3.cc: Block 1 written
+ct3.cc: Asking to write 2
+libtransaction[tid #9]: transaction monitor denied write access to block # 2 at this time.
+libtransaction: sleeping 2 seconds before restarting.
+Restarting transaction...
+ct3.cc: Asking to write block #1
+ct3.cc: Block 1 written
+ct3.cc: Asking to write 2
+ct3.cc: Block 2 written
+libtransaction[tid #7]: transaction Monitor Preempted this transaction.
+libtransaction[tid #7]: aborting Transaction!
+Transaction failed. Now aborting!
+
+
+Testing the LogManager : Recovery and Rollback services
+=======================================================
+
+The Transaction monitor recovers any transaction that has failed after sending a 'COMMIT' to the monitor but before sending 'END'. This is a vulnerable period for a transaction since the actual disk writes are performed during this time. To observe this however, special provisions are made inside libtransaction.a.
+
+** NOTE: You have to recompile the code to run these tests **
+
+Step 1: stop the transaction processing monitor (if running) by pressing ctrl-c
+
+Step 2: edit the file config.h. Uncomment one line ONLY as shown below:
+
+// UNCOMMENT these two lines if you want to observe rollback and/or recovery
+// See README for more information
+
+# define OBSERVE_ROLLBACK ---> this line uncommented.
+//# define OBSERVE_RECOVERY
+
+
+Step 3: Type 'make' to recompile System/T
+
+Step 4: Restart the transaction monitor (tpmd) in another terminal window
+
+Step 5: run ./serial_tests
+
+You will now observe that each serial test sleeps for a while after committing some blocks to the dis. Press Ctrl-C at this point and observe messages at the monitor.
+
+[client side output]
+
+------------ serial test #1 - Allocates a few blocks -------
+Allocated block #1
+Allocated block #2
+Allocated block #3
+Allocated block #4
+Allocated block #5
+ALL COMMIT operations done. Now sleeping for 5 seconds. You can send a signal now to observe rollback
+
+[ctrl-c]
+
+[server side output]
+
+Transaction Processing monitor running on port 2983...
+Assigned new TID : 1 to process 14616
+Transaction #1 is a writer for block # 1
+Transaction #1 is a writer for block # 2
+Transaction #1 is a writer for block # 3
+Transaction #1 is a writer for block # 4
+Transaction #1 is a writer for block # 5
+Transaction 1 has disconnected.
+Logmanager starts to rollback transaction # 1
+UNDO records collected..
+1       A
+Undoing an ALLOCATE operation on block 5
+1       A
+Undoing an ALLOCATE operation on block 4
+1       A
+Undoing an ALLOCATE operation on block 3
+1       A
+Undoing an ALLOCATE operation on block 2
+1       A
+Undoing an ALLOCATE operation on block 1
+1       B
+Writing an ABORT record to log
+Flushing transaction..1
+
+
+Observing full system recovery
+==============================
+
+A full system recovery and integrity check is required if the transaction monitor fails. A recovery program is provided with System/T (called `recover'). This program must be run whenever the monitor fails / is restarted. This program will read the log and undo any transactions that have NOT completed. 
+
+To observe recovery by the `recover' program, we must have a condition where both the transaction and the transaction monitor fail at the same time. For this, I have made another provision at the monitor side.
+
+
+Step 1: stop the transaction monitor if running
+
+Step 2: edit the config.h file. Uncomment both symbols as shown below:
+
+// UNCOMMENT these two lines if you want to observe rollback and/or recovery
+// See README for more information
+
+# define OBSERVE_ROLLBACK ---> this line uncommented.
+# define OBSERVE_RECOVERY ---> this line too.
+
+
+Step 3: restart the monitor program
+
+Step 4: Now run the serial_tests script again and press ctrl-c when offered to send a signal.
+
+[client side output]
+
+------------ serial test #1 - Allocates a few blocks -------
+Allocated block #1
+Allocated block #2
+Allocated block #3
+Allocated block #4
+Allocated block #5
+ALL COMMIT operations done. Now sleeping for 5 seconds. You can send a signal now to observe rollback
+
+[ctrl-c]
+
+
+[monitor side output]
+
+Transaction Processing monitor running on port 2983...
+Assigned new TID : 1 to process 14741
+Transaction #1 is a writer for block # 1
+Transaction #1 is a writer for block # 2
+Transaction #1 is a writer for block # 3
+Transaction #1 is a writer for block # 4
+Transaction #1 is a writer for block # 5
+Transaction 1 has disconnected.
+A transaction died during COMMIT phase. Recovery testing is enabled. I am dying too. Run ./recover to recover the datastore and restart the monitor
+Killed
+
+Step 5: Now run ./recover to recover the data store.
+
+$ ./recover
+Checking integrity of datastore..
+1 broken transaction(s).
+Fixing store..
+UNDO records collected..
+1       B
+1       A
+Undoing an ALLOCATE operation on block 1
+1       A
+Undoing an ALLOCATE operation on block 2
+1       A
+Undoing an ALLOCATE operation on block 3
+1       A
+Undoing an ALLOCATE operation on block 4
+1       A
+Undoing an ALLOCATE operation on block 5
+
+
+
+
+
+
+
+
+
+
+
+

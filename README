@@ -1,0 +1,53 @@
+System/T - Implementation of a transactional store
+==================================================
+
+CS 485 - Networked Operating Systems Programming
+
+Satya Popuri
+spopur2 [at] uic [dot] edu
+
+
+
+To set compile time parameters, edit file <config.h>
+
+BLOCKSIZE  - sets the blocksize. Default is 4096. ** See doc/TESTING for a note on this. **
+NBLOCKS    - Number of blocks available in the data store. Default is 30.
+MAXTIMEOUT - Maximum time (in seconds) a transaction must sleep before the last retry
+TIMESLICE  - Maximum time (in seconds) allowed for a transaction to complete in the face of lock conflicts
+
+STOREFILE  - path to the datastore file
+INDEXFILE  - path to the index file
+LOGFILE    - path to the (binary) log file
+ALOGFILE   - path to the (ascii) log file
+
+TPM_PORT   - port on which Transaction monitor listens
+TPM_HOST   - Host name of the transaction monitor.
+
+To compile:
+
+$ cd src/
+$ make
+
+libtransaction.a is now generated in the src/ folder. Application programs can link to it.
+
+To run tests:
+
+$ ./tpmd 
+
+starts the transaction processing monitor. 
+Open another terminal emulator/virutal terminal/screen session
+
+to run serial tests:
+
+$ ./serial_tests
+
+
+to run concurrent tests:
+
+$ ./concurrent_tests
+
+see doc/TESTING for more information on how to run these tests and more.
+
+
+Documentation is available in doc/DOCUMENTATION.
+
