@@ -1,12 +1,10 @@
 System/T - Implementation of a transactional store
 ==================================================
+http://www.cs.uic.edu/~spopuri/tstore.html
 
 CS 485 - Networked Operating Systems Programming
 
-Satya Popuri
-spopur2 [at] uic [dot] edu
-
-
+Satya K Popuri
 
 To set compile time parameters, edit file <config.h>
 
